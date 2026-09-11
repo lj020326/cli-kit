@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -17,8 +18,16 @@ type URLOptions struct {
 	AllowLocalhost bool
 	// AllowPrivateIP allows private IP addresses (default: false)
 	AllowPrivateIP bool
-	// ResolveHostTimeout enables DNS resolution for hostnames and sets timeout; 0 disables resolution (default: 5s)
+	// ResolveHostTimeout is the timeout for resolving a hostname to check its
+	// addresses. Zero means "use the default" (5s), not "skip resolving":
+	// leaving a field at its zero value must not switch a security check off.
+	// Use DisableHostResolution to opt out deliberately.
 	ResolveHostTimeout time.Duration
+
+	// DisableHostResolution skips DNS resolution, so a hostname is accepted on
+	// its scheme alone. Only set this when something else performs the check --
+	// SSRFDialControl, for instance.
+	DisableHostResolution bool
 }
 
 // defaultURLOptions returns default URL validation options
@@ -32,7 +41,17 @@ func defaultURLOptions() *URLOptions {
 }
 
 // normalizeURLOptions merges caller-provided options with secure defaults.
-// AllowedSchemes keeps the default allowlist unless explicitly provided (including empty slice).
+//
+// Every field here has to distinguish "not set" from "set to the zero value",
+// or a caller who overrides one field silently gets the zero value for the
+// rest. ResolveHostTimeout was the dangerous case: it was copied
+// unconditionally, and zero meant "skip DNS resolution", so
+//
+//	&URLOptions{AllowedSchemes: []string{"https"}}
+//
+// turned the hostname SSRF check off entirely while looking like it only
+// narrowed the scheme list. Zero now means "use the default"; opting out is
+// spelled DisableHostResolution.
 func normalizeURLOptions(opts *URLOptions) *URLOptions {
 	normalized := defaultURLOptions()
 	if opts == nil {
@@ -44,7 +63,10 @@ func normalizeURLOptions(opts *URLOptions) *URLOptions {
 	}
 	normalized.AllowLocalhost = opts.AllowLocalhost
 	normalized.AllowPrivateIP = opts.AllowPrivateIP
-	normalized.ResolveHostTimeout = opts.ResolveHostTimeout
+	normalized.DisableHostResolution = opts.DisableHostResolution
+	if opts.ResolveHostTimeout > 0 {
+		normalized.ResolveHostTimeout = opts.ResolveHostTimeout
+	}
 
 	return normalized
 }
@@ -99,10 +121,13 @@ func ValidateURL(urlStr string, opts *URLOptions) error {
 		return fmt.Errorf("URL must contain a valid host")
 	}
 
-	// Check localhost
+	// Check localhost. The trailing dot and the ".localhost" suffix both
+	// resolve to the loopback interface, so a bare string compare against
+	// "localhost" was not enough on its own.
 	if !opts.AllowLocalhost {
-		hostLower := strings.ToLower(host)
-		if hostLower == "localhost" || hostLower == "127.0.0.1" || hostLower == "::1" {
+		hostLower := strings.ToLower(strings.TrimSuffix(host, "."))
+		if hostLower == "localhost" || strings.HasSuffix(hostLower, ".localhost") ||
+			hostLower == "127.0.0.1" || hostLower == "::1" {
 			return fmt.Errorf("access to localhost is not allowed")
 		}
 	}
@@ -116,8 +141,14 @@ func ValidateURL(urlStr string, opts *URLOptions) error {
 		return nil
 	}
 
-	// Host is a hostname: resolve and check all resolved IPs when timeout is set
-	if opts.ResolveHostTimeout > 0 {
+	// Host is a hostname: resolve and check every address it maps to.
+	//
+	// NOTE: this is a check-then-use. The caller resolves the name again when
+	// it actually connects, and a short-TTL record can answer differently the
+	// second time (DNS rebinding): public address here, 169.254.169.254 there.
+	// Use SSRFDialControl on the dialer that performs the request to close
+	// that window; ValidateURL alone cannot.
+	if !opts.DisableHostResolution && opts.ResolveHostTimeout > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), opts.ResolveHostTimeout)
 		defer cancel()
 		resolver := &net.Resolver{}
@@ -211,7 +242,44 @@ func isPrivateIP(ip net.IP) bool {
 		if ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19) {
 			return true
 		}
+		// IETF protocol assignments (192.0.0.0/24) and TEST-NET-1
+		// (192.0.2.0/24) are not routable destinations.
+		if ip4[0] == 192 && ip4[1] == 0 && (ip4[2] == 0 || ip4[2] == 2) {
+			return true
+		}
+		// Reserved for future use, 240.0.0.0/4.
+		if ip4[0] >= 240 {
+			return true
+		}
 	}
 
 	return false
+}
+
+// SSRFDialControl returns a function for net.Dialer.Control that rejects a
+// connection whose resolved address is not allowed by opts.
+//
+// This is the half of SSRF protection that ValidateURL cannot provide. The
+// validator inspects the addresses a name resolved to at validation time; the
+// Control hook runs against the address actually being connected to, after the
+// resolution that the request itself performed, so a rebinding answer is
+// caught.
+//
+//	dialer := &net.Dialer{Control: validator.SSRFDialControl(opts)}
+//	transport := http.DefaultTransport.(*http.Transport).Clone()
+//	transport.DialContext = dialer.DialContext
+func SSRFDialControl(opts *URLOptions) func(network, address string, c syscall.RawConn) error {
+	normalized := normalizeURLOptions(opts)
+
+	return func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return fmt.Errorf("unable to parse dial address %q: %w", address, err)
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return fmt.Errorf("dial address %q is not an IP", host)
+		}
+		return checkIPAllowed(ip, normalized)
+	}
 }

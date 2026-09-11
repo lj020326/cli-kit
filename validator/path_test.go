@@ -215,6 +215,13 @@ func TestValidateFileExists(t *testing.T) {
 }
 
 func TestValidateFileReadable(t *testing.T) {
+	// Permission bits are not enforced for uid 0, so the unreadable /
+	// read-only cases below cannot be simulated in a root container --
+	// which is the default for many CI images.
+	if os.Geteuid() == 0 {
+		t.Skip("permission bits are not enforced for root")
+	}
+
 	// Create a temporary file for testing
 	tmpFile, err := os.CreateTemp("", "test_readable_*")
 	if err != nil {
@@ -315,6 +322,13 @@ func TestValidateDirExists(t *testing.T) {
 }
 
 func TestValidateDirWritable(t *testing.T) {
+	// Permission bits are not enforced for uid 0, so the unreadable /
+	// read-only cases below cannot be simulated in a root container --
+	// which is the default for many CI images.
+	if os.Geteuid() == 0 {
+		t.Skip("permission bits are not enforced for root")
+	}
+
 	// Create a temporary directory for testing
 	tmpDir, err := os.MkdirTemp("", "test_dir_writable_*")
 	if err != nil {

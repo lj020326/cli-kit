@@ -42,6 +42,12 @@ func defaultPathOptions() *PathOptions {
 // Returns:
 //   - string: Normalized absolute path
 //   - error: Returns error if path is invalid or has security risks; otherwise returns nil
+//
+// NOTE: the returned path is a name, not an open handle, so the usual
+// time-of-check/time-of-use gap applies -- a component can be replaced with a
+// symlink between this call and the open. Where that matters, open first and
+// validate the opened file (os.File.Name plus a Stat comparison), or hold the
+// directory open across both operations.
 func ValidatePath(path string, opts *PathOptions) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path cannot be empty")
@@ -52,9 +58,11 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 		opts = defaultPathOptions()
 	}
 
-	// Check for path traversal in original path before converting to absolute
+	// Check for path traversal in original path before converting to absolute.
+	// ".." only counts as a whole path segment: "backup..2024.log" and
+	// "..hidden" are legal names and were being rejected by a substring match.
 	if opts.CheckTraversal {
-		if strings.Contains(path, "..") {
+		if containsTraversalSegment(path) {
 			return "", fmt.Errorf("path cannot contain path traversal characters (..)")
 		}
 	}
@@ -115,7 +123,7 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 
 // containsTraversalSegment returns true if path contains ".." as a path segment.
 func containsTraversalSegment(path string) bool {
-	for _, part := range strings.Split(path, string(filepath.Separator)) {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
 		if part == ".." {
 			return true
 		}
@@ -123,16 +131,49 @@ func containsTraversalSegment(path string) bool {
 	return false
 }
 
-// resolvePathForPolicy resolves symlinks when the target exists and returns a cleaned path.
+// resolvePathForPolicy resolves symlinks so policy checks apply to the real
+// on-disk target.
+//
+// For a path that does not exist yet -- creating a file, say -- EvalSymlinks
+// fails outright, and simply falling back to the cleaned path checked the
+// policy against the *unresolved* name. That let a symlinked parent escape:
+// with /allowed/link a symlink to /etc, validating /allowed/link/newfile
+// looked like it was under /allowed while the write actually landed in
+// /etc/newfile. Reads of existing files were protected; creating new ones was
+// not.
+//
+// So resolve the deepest ancestor that does exist, then re-attach the
+// remaining components to the resolved prefix.
 func resolvePathForPolicy(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err == nil {
 		return filepath.Clean(resolved), nil
 	}
-	if os.IsNotExist(err) {
-		return filepath.Clean(path), nil
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("unable to resolve path symlinks: %w", err)
 	}
-	return "", fmt.Errorf("unable to resolve path symlinks: %w", err)
+
+	cleaned := filepath.Clean(path)
+	var trailing []string
+	current := cleaned
+
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the root without finding anything that exists.
+			return cleaned, nil
+		}
+		trailing = append([]string{filepath.Base(current)}, trailing...)
+		current = parent
+
+		resolvedParent, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Clean(filepath.Join(append([]string{resolvedParent}, trailing...)...)), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("unable to resolve path symlinks: %w", err)
+		}
+	}
 }
 
 // isPathWithinBase returns true when path == base or path is under base.
