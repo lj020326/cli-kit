@@ -215,13 +215,6 @@ func TestValidateFileExists(t *testing.T) {
 }
 
 func TestValidateFileReadable(t *testing.T) {
-	// Permission bits are not enforced for uid 0, so the unreadable /
-	// read-only cases below cannot be simulated in a root container --
-	// which is the default for many CI images.
-	if os.Geteuid() == 0 {
-		t.Skip("permission bits are not enforced for root")
-	}
-
 	// Create a temporary file for testing
 	tmpFile, err := os.CreateTemp("", "test_readable_*")
 	if err != nil {
@@ -251,8 +244,13 @@ func TestValidateFileReadable(t *testing.T) {
 		})
 	}
 
-	// File exists but not readable (no read permission) - covers os.Open failure path
-	if runtime.GOOS != "windows" {
+	// File exists but not readable (no read permission) - covers os.Open failure path.
+	//
+	// Permission bits are not enforced for uid 0, so this case alone cannot be
+	// simulated in a root container -- the default for many CI images. The
+	// table-driven cases above do not depend on permission bits and keep
+	// running there.
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 		noReadFile, err := os.CreateTemp("", "test_noread_*")
 		if err != nil {
 			t.Fatalf("Failed to create temp file: %v", err)
@@ -322,13 +320,6 @@ func TestValidateDirExists(t *testing.T) {
 }
 
 func TestValidateDirWritable(t *testing.T) {
-	// Permission bits are not enforced for uid 0, so the unreadable /
-	// read-only cases below cannot be simulated in a root container --
-	// which is the default for many CI images.
-	if os.Geteuid() == 0 {
-		t.Skip("permission bits are not enforced for root")
-	}
-
 	// Create a temporary directory for testing
 	tmpDir, err := os.MkdirTemp("", "test_dir_writable_*")
 	if err != nil {
@@ -355,8 +346,10 @@ func TestValidateDirWritable(t *testing.T) {
 		})
 	}
 
-	// Read-only directory: Create should fail (covers ErrDirNotWritable path)
-	if runtime.GOOS != "windows" {
+	// Read-only directory: Create should fail (covers ErrDirNotWritable path).
+	// Skipped for uid 0, which is not subject to the permission bits; the
+	// table-driven cases above still run there.
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 		readOnlyDir, err := os.MkdirTemp("", "test_readonly_*")
 		if err != nil {
 			t.Fatalf("Failed to create temp dir: %v", err)
