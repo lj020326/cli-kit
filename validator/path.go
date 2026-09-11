@@ -105,9 +105,17 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 				break
 			}
 
-			// Also honor allowed directory symlinks when they exist.
-			allowedResolvedDir, err := filepath.EvalSymlinks(allowedAbsDir)
-			if err == nil && isPathWithinBase(resolvedPath, filepath.Clean(allowedResolvedDir)) {
+			// Resolve the allowed base the SAME way the requested path was
+			// resolved: partially, down to its deepest existing ancestor.
+			//
+			// EvalSymlinks alone fails outright when the allowed directory
+			// does not exist yet. With `alias -> /real` and
+			// AllowedDirs: ["alias/future"], the requested "alias/future/file"
+			// canonicalizes to "/real/future/file" while the base stayed the
+			// lexical "alias/future", so a genuinely contained creation was
+			// rejected.
+			allowedResolvedDir, err := resolvePathForPolicy(allowedAbsDir)
+			if err == nil && isPathWithinBase(resolvedPath, allowedResolvedDir) {
 				allowed = true
 				break
 			}

@@ -242,9 +242,17 @@ func isPrivateIP(ip net.IP) bool {
 		if ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19) {
 			return true
 		}
-		// IETF protocol assignments (192.0.0.0/24) and TEST-NET-1
-		// (192.0.2.0/24) are not routable destinations.
-		if ip4[0] == 192 && ip4[1] == 0 && (ip4[2] == 0 || ip4[2] == 2) {
+		// TEST-NET-1 (192.0.2.0/24) is not a routable destination.
+		if ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2 {
+			return true
+		}
+		// IETF protocol assignments (192.0.0.0/24) are mostly non-routable,
+		// but the block carries documented globally reachable exceptions:
+		// 192.0.0.9 (PCP anycast, RFC 7723) and 192.0.0.10 (TURN anycast,
+		// RFC 8155). Blocking the whole /24 forced callers validating URLs
+		// for those services to enable ALL private addresses just to reach a
+		// public anycast endpoint.
+		if ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0 && ip4[3] != 9 && ip4[3] != 10 {
 			return true
 		}
 		// Reserved for future use, 240.0.0.0/4.
@@ -268,6 +276,16 @@ func isPrivateIP(ip net.IP) bool {
 //	dialer := &net.Dialer{Control: validator.SSRFDialControl(opts)}
 //	transport := http.DefaultTransport.(*http.Transport).Clone()
 //	transport.DialContext = dialer.DialContext
+//	transport.Proxy = nil // see below
+//
+// Proxying must be disabled for this to mean anything. Cloning
+// http.DefaultTransport keeps ProxyFromEnvironment, so with HTTP_PROXY or
+// HTTPS_PROXY set the hook sees the PROXY's address rather than the origin's:
+// a public proxy would happily resolve a rebinding hostname to an internal
+// address without this control ever seeing it, while a private corporate
+// proxy is rejected outright for being a private address. Where a proxy is
+// required, this hook only closes the rebinding window for direct
+// connections and the proxy itself has to enforce the policy.
 func SSRFDialControl(opts *URLOptions) func(network, address string, c syscall.RawConn) error {
 	normalized := normalizeURLOptions(opts)
 
@@ -276,6 +294,15 @@ func SSRFDialControl(opts *URLOptions) func(network, address string, c syscall.R
 		if err != nil {
 			return fmt.Errorf("unable to parse dial address %q: %w", address, err)
 		}
+		// Strip the IPv6 zone before parsing: SplitHostPort returns
+		// "fe80::1%eth0" for "[fe80::1%eth0]:443", which net.ParseIP cannot
+		// parse -- so a scoped link-local address was rejected as "not an IP"
+		// even when link-local was explicitly allowed, and a zone is normally
+		// required for such an address to be usable at all.
+		if zone := strings.IndexByte(host, '%'); zone >= 0 {
+			host = host[:zone]
+		}
+
 		ip := net.ParseIP(host)
 		if ip == nil {
 			return fmt.Errorf("dial address %q is not an IP", host)

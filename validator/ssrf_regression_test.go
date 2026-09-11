@@ -1,8 +1,10 @@
 package validator
 
 import (
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,5 +141,80 @@ func TestTraversalCheckIsSegmentWise(t *testing.T) {
 
 	if _, err := ValidatePath(filepath.Join(base, "..", "escape"), opts); err == nil {
 		t.Error("a real traversal was accepted")
+	}
+}
+
+// --- Codex review round 2 (PR #6) ---
+
+// TestGloballyReachableAnycastIsNotPrivate: 192.0.0.0/24 is mostly IETF
+// protocol assignments, but it carries documented globally reachable
+// exceptions -- 192.0.0.9 (PCP anycast, RFC 7723) and 192.0.0.10 (TURN
+// anycast, RFC 8155). Blocking the whole /24 forced callers validating URLs
+// for those services to enable ALL private addresses to reach a public
+// endpoint.
+func TestGloballyReachableAnycastIsNotPrivate(t *testing.T) {
+	for _, ip := range []string{"192.0.0.9", "192.0.0.10"} {
+		if isPrivateIP(net.ParseIP(ip)) {
+			t.Errorf("%s classified private; it is a documented globally reachable anycast address", ip)
+		}
+	}
+	// The rest of the block, and TEST-NET-1, stay blocked.
+	for _, ip := range []string{"192.0.0.1", "192.0.0.8", "192.0.0.11", "192.0.2.1"} {
+		if !isPrivateIP(net.ParseIP(ip)) {
+			t.Errorf("%s is not a routable destination and must stay blocked", ip)
+		}
+	}
+}
+
+// TestDialControlAcceptsScopedIPv6: SplitHostPort returns "fe80::1%eth0" for
+// "[fe80::1%eth0]:443", which net.ParseIP cannot parse -- so a scoped
+// link-local address was rejected as "not an IP" even when link-local was
+// explicitly allowed, and a zone is normally required for such an address to
+// be usable at all.
+func TestDialControlAcceptsScopedIPv6(t *testing.T) {
+	control := SSRFDialControl(&URLOptions{AllowPrivateIP: true, DisableHostResolution: true})
+
+	if err := control("tcp6", "[fe80::1%eth0]:443", nil); err != nil {
+		t.Errorf("scoped link-local dial rejected: %v", err)
+	}
+	// Without AllowPrivateIP it is still refused -- but as a private address,
+	// not as an unparseable one.
+	strict := SSRFDialControl(&URLOptions{DisableHostResolution: true})
+	err := strict("tcp6", "[fe80::1%eth0]:443", nil)
+	if err == nil {
+		t.Error("scoped link-local dial allowed without AllowPrivateIP")
+	} else if strings.Contains(err.Error(), "not an IP") {
+		t.Errorf("scoped address reported as unparseable: %v", err)
+	}
+}
+
+// TestAllowedDirsResolvePartially is the regression test for resolving the
+// requested path partially while leaving each allowed base lexical. With
+// `alias -> /real` and AllowedDirs: ["alias/future"], the requested
+// "alias/future/file" canonicalizes to "/real/future/file" while the base
+// stayed "alias/future", so a genuinely contained creation was rejected.
+func TestAllowedDirsResolvePartially(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	opts := &PathOptions{AllowedDirs: []string{filepath.Join(alias, "future")}}
+
+	// "future" does not exist yet: this is the create-new-file case.
+	target := filepath.Join(alias, "future", "file.txt")
+	if _, err := ValidatePath(target, opts); err != nil {
+		t.Errorf("ValidatePath(%q) = %v, want it allowed: the base resolves to the same place", target, err)
+	}
+
+	// Containment is still enforced.
+	outside := filepath.Join(alias, "elsewhere", "file.txt")
+	if _, err := ValidatePath(outside, opts); err == nil {
+		t.Error("a path outside the allowed directory was accepted")
 	}
 }
