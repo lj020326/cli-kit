@@ -70,6 +70,21 @@ func TestContainsTraversalSegment(t *testing.T) {
 		{"a/..", true},
 		{"", false},
 		{string(filepath.Separator) + "..", true},
+
+		// Windows drive-RELATIVE paths: the parent segment is fused to the
+		// drive letter, so splitting on separators alone never sees "..".
+		// filepath.Abs then resolved the traversal away before the
+		// containment check could catch it.
+		{"C:../secret", true},
+		{"c:../secret", true},
+		{"C:..", true},
+		{"C:/absolute/ok", false},
+
+		// A leading "X:" that is not a drive letter, and ordinary names that
+		// merely start with "..", stay allowed.
+		{"1:../secret", false},
+		{"..hidden", false},
+		{"backup..2024.log", false},
 	}
 	for _, tt := range tests {
 		got := containsTraversalSegment(tt.path)

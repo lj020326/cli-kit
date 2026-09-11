@@ -131,12 +131,37 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 
 // containsTraversalSegment returns true if path contains ".." as a path segment.
 func containsTraversalSegment(path string) bool {
+	// The drive prefix comes off first. A Windows drive-RELATIVE path fuses
+	// its first segment to the drive letter: "C:..\secret" is "C:../secret"
+	// after ToSlash, whose leading segment is "C:..", not "..". That slipped
+	// through here, and filepath.Abs then resolved and cleaned the traversal
+	// away before the containment check below could see it -- so
+	// CheckTraversal accepted an input the substring test it replaced had
+	// rejected.
+	path = path[windowsVolumeLen(path):]
+
 	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
 		if part == ".." {
 			return true
 		}
 	}
 	return false
+}
+
+// windowsVolumeLen returns the length of a leading Windows drive prefix
+// ("C:"), or 0 when there is none.
+//
+// filepath.VolumeName is not used because it only recognises one when GOOS is
+// windows, and a path string reaching this validator need not have been
+// written on the machine validating it. For a traversal check, recognising one
+// too eagerly only rejects more.
+func windowsVolumeLen(path string) int {
+	if len(path) >= 2 && path[1] == ':' {
+		if c := path[0]; ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') {
+			return 2
+		}
+	}
+	return 0
 }
 
 // resolvePathForPolicy resolves symlinks so policy checks apply to the real
