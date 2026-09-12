@@ -218,3 +218,59 @@ func TestAllowedDirsResolvePartially(t *testing.T) {
 		t.Error("a path outside the allowed directory was accepted")
 	}
 }
+
+// --- Codex review round 6 (PR #6) ---
+
+// TestTraversalRejectsWindowsNormalizedParents is the regression test for the
+// exact ".." segment comparison.
+//
+// Win32 strips trailing spaces and periods from a path component, so `.. ` is
+// opened as `..` and traverses to the parent. Comparing the segment exactly
+// accepted `safe\.. \secret`, which the substring check it replaced had
+// rejected -- so relaxing the check to allow legal names like "..hidden"
+// reopened a traversal on Windows.
+func TestTraversalRejectsWindowsNormalizedParents(t *testing.T) {
+	opts := &PathOptions{CheckTraversal: true}
+
+	for _, path := range []string{
+		// The reported case, in both separators: the validator has to treat a
+		// path string as untrusted regardless of the host it is running on.
+		`safe\.. \secret`,
+		"safe/.. /secret",
+		"safe/..  /secret",
+
+		// Spellings whose exact Win32 normalization is not worth depending on.
+		"safe/.../secret",
+		"safe/.. ./secret",
+		"safe/ ../secret",
+
+		// The plain form must keep being rejected.
+		"safe/../secret",
+	} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := ValidatePath(path, opts); err == nil {
+				t.Errorf("ValidatePath(%q) was accepted; it reaches the parent directory once the platform normalizes it", path)
+			}
+		})
+	}
+}
+
+// TestTraversalKeepsLegalDottedNames guards the other direction: relaxing the
+// substring check was itself a fix, and these names must stay valid.
+func TestTraversalKeepsLegalDottedNames(t *testing.T) {
+	opts := &PathOptions{CheckTraversal: true}
+
+	for _, path := range []string{
+		"safe/..hidden/file",
+		"safe/backup..2024.log",
+		"safe/file..txt",
+		"safe/.config/file",
+		"safe/a..b/file",
+	} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := ValidatePath(path, opts); err != nil {
+				t.Errorf("ValidatePath(%q) = %v, want it accepted: no segment is a parent reference", path, err)
+			}
+		})
+	}
+}

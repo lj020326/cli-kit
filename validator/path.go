@@ -140,12 +140,53 @@ func containsTraversalSegment(path string) bool {
 	// rejected.
 	path = path[windowsVolumeLen(path):]
 
-	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
-		if part == ".." {
+	// Split on BOTH separators, on every platform. filepath.ToSlash is a
+	// no-op outside Windows, so a backslash-separated path validated on Linux
+	// was one long segment and no traversal in it was visible -- and the same
+	// reasoning as windowsVolumeLen applies: the string need not have been
+	// written on the machine validating it, and a path this validator blesses
+	// may well be used on one where "\" separates. Empty segments are dropped;
+	// none of them is a parent reference.
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if isParentSegment(part) {
 			return true
 		}
 	}
 	return false
+}
+
+// isParentSegment reports whether a path segment refers to the parent
+// directory once the platform is done with it.
+//
+// Not just `part == ".."`. Win32 strips trailing spaces and periods from a
+// path component, so ".. " is opened as ".." and traverses -- an exact
+// comparison accepted `safe\.. \secret` while the substring check this
+// replaced had rejected it.
+//
+// Any segment made only of periods and spaces with at least two periods
+// counts. That is wider than the one spelling: the exact order in which Win32
+// strips a trailing run of periods and spaces is not something a security
+// check should depend on, and the segments this over-rejects -- "...",
+// ".. ." -- cannot name a file on Windows at all, since normalization leaves
+// them empty. On POSIX "..." IS a legal name, so this refuses one legal
+// spelling; under an explicitly requested traversal check that is the right
+// side to err on, and the same reasoning as windowsVolumeLen below: a path
+// string reaching this validator need not have been written on the machine
+// validating it.
+func isParentSegment(part string) bool {
+	dots := 0
+	for i := 0; i < len(part); i++ {
+		switch part[i] {
+		case '.':
+			dots++
+		case ' ':
+		default:
+			return false
+		}
+	}
+	return dots >= 2
 }
 
 // windowsVolumeLen returns the length of a leading Windows drive prefix
