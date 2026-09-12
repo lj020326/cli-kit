@@ -42,6 +42,12 @@ func defaultPathOptions() *PathOptions {
 // Returns:
 //   - string: Normalized absolute path
 //   - error: Returns error if path is invalid or has security risks; otherwise returns nil
+//
+// NOTE: the returned path is a name, not an open handle, so the usual
+// time-of-check/time-of-use gap applies -- a component can be replaced with a
+// symlink between this call and the open. Where that matters, open first and
+// validate the opened file (os.File.Name plus a Stat comparison), or hold the
+// directory open across both operations.
 func ValidatePath(path string, opts *PathOptions) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path cannot be empty")
@@ -52,9 +58,11 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 		opts = defaultPathOptions()
 	}
 
-	// Check for path traversal in original path before converting to absolute
+	// Check for path traversal in original path before converting to absolute.
+	// ".." only counts as a whole path segment: "backup..2024.log" and
+	// "..hidden" are legal names and were being rejected by a substring match.
 	if opts.CheckTraversal {
-		if strings.Contains(path, "..") {
+		if containsTraversalSegment(path) {
 			return "", fmt.Errorf("path cannot contain path traversal characters (..)")
 		}
 	}
@@ -97,9 +105,17 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 				break
 			}
 
-			// Also honor allowed directory symlinks when they exist.
-			allowedResolvedDir, err := filepath.EvalSymlinks(allowedAbsDir)
-			if err == nil && isPathWithinBase(resolvedPath, filepath.Clean(allowedResolvedDir)) {
+			// Resolve the allowed base the SAME way the requested path was
+			// resolved: partially, down to its deepest existing ancestor.
+			//
+			// EvalSymlinks alone fails outright when the allowed directory
+			// does not exist yet. With `alias -> /real` and
+			// AllowedDirs: ["alias/future"], the requested "alias/future/file"
+			// canonicalizes to "/real/future/file" while the base stayed the
+			// lexical "alias/future", so a genuinely contained creation was
+			// rejected.
+			allowedResolvedDir, err := resolvePathForPolicy(allowedAbsDir)
+			if err == nil && isPathWithinBase(resolvedPath, allowedResolvedDir) {
 				allowed = true
 				break
 			}
@@ -115,24 +131,123 @@ func ValidatePath(path string, opts *PathOptions) (string, error) {
 
 // containsTraversalSegment returns true if path contains ".." as a path segment.
 func containsTraversalSegment(path string) bool {
-	for _, part := range strings.Split(path, string(filepath.Separator)) {
-		if part == ".." {
+	// The drive prefix comes off first. A Windows drive-RELATIVE path fuses
+	// its first segment to the drive letter: "C:..\secret" is "C:../secret"
+	// after ToSlash, whose leading segment is "C:..", not "..". That slipped
+	// through here, and filepath.Abs then resolved and cleaned the traversal
+	// away before the containment check below could see it -- so
+	// CheckTraversal accepted an input the substring test it replaced had
+	// rejected.
+	path = path[windowsVolumeLen(path):]
+
+	// Split on BOTH separators, on every platform. filepath.ToSlash is a
+	// no-op outside Windows, so a backslash-separated path validated on Linux
+	// was one long segment and no traversal in it was visible -- and the same
+	// reasoning as windowsVolumeLen applies: the string need not have been
+	// written on the machine validating it, and a path this validator blesses
+	// may well be used on one where "\" separates. Empty segments are dropped;
+	// none of them is a parent reference.
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if isParentSegment(part) {
 			return true
 		}
 	}
 	return false
 }
 
-// resolvePathForPolicy resolves symlinks when the target exists and returns a cleaned path.
+// isParentSegment reports whether a path segment refers to the parent
+// directory once the platform is done with it.
+//
+// Not just `part == ".."`. Win32 strips trailing spaces and periods from a
+// path component, so ".. " is opened as ".." and traverses -- an exact
+// comparison accepted `safe\.. \secret` while the substring check this
+// replaced had rejected it.
+//
+// Any segment made only of periods and spaces with at least two periods
+// counts. That is wider than the one spelling: the exact order in which Win32
+// strips a trailing run of periods and spaces is not something a security
+// check should depend on, and the segments this over-rejects -- "...",
+// ".. ." -- cannot name a file on Windows at all, since normalization leaves
+// them empty. On POSIX "..." IS a legal name, so this refuses one legal
+// spelling; under an explicitly requested traversal check that is the right
+// side to err on, and the same reasoning as windowsVolumeLen below: a path
+// string reaching this validator need not have been written on the machine
+// validating it.
+func isParentSegment(part string) bool {
+	dots := 0
+	for i := 0; i < len(part); i++ {
+		switch part[i] {
+		case '.':
+			dots++
+		case ' ':
+		default:
+			return false
+		}
+	}
+	return dots >= 2
+}
+
+// windowsVolumeLen returns the length of a leading Windows drive prefix
+// ("C:"), or 0 when there is none.
+//
+// filepath.VolumeName is not used because it only recognises one when GOOS is
+// windows, and a path string reaching this validator need not have been
+// written on the machine validating it. For a traversal check, recognising one
+// too eagerly only rejects more.
+func windowsVolumeLen(path string) int {
+	if len(path) >= 2 && path[1] == ':' {
+		if c := path[0]; ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') {
+			return 2
+		}
+	}
+	return 0
+}
+
+// resolvePathForPolicy resolves symlinks so policy checks apply to the real
+// on-disk target.
+//
+// For a path that does not exist yet -- creating a file, say -- EvalSymlinks
+// fails outright, and simply falling back to the cleaned path checked the
+// policy against the *unresolved* name. That let a symlinked parent escape:
+// with /allowed/link a symlink to /etc, validating /allowed/link/newfile
+// looked like it was under /allowed while the write actually landed in
+// /etc/newfile. Reads of existing files were protected; creating new ones was
+// not.
+//
+// So resolve the deepest ancestor that does exist, then re-attach the
+// remaining components to the resolved prefix.
 func resolvePathForPolicy(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err == nil {
 		return filepath.Clean(resolved), nil
 	}
-	if os.IsNotExist(err) {
-		return filepath.Clean(path), nil
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("unable to resolve path symlinks: %w", err)
 	}
-	return "", fmt.Errorf("unable to resolve path symlinks: %w", err)
+
+	cleaned := filepath.Clean(path)
+	var trailing []string
+	current := cleaned
+
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the root without finding anything that exists.
+			return cleaned, nil
+		}
+		trailing = append([]string{filepath.Base(current)}, trailing...)
+		current = parent
+
+		resolvedParent, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Clean(filepath.Join(append([]string{resolvedParent}, trailing...)...)), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("unable to resolve path symlinks: %w", err)
+		}
+	}
 }
 
 // isPathWithinBase returns true when path == base or path is under base.

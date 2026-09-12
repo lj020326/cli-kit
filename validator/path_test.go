@@ -70,6 +70,21 @@ func TestContainsTraversalSegment(t *testing.T) {
 		{"a/..", true},
 		{"", false},
 		{string(filepath.Separator) + "..", true},
+
+		// Windows drive-RELATIVE paths: the parent segment is fused to the
+		// drive letter, so splitting on separators alone never sees "..".
+		// filepath.Abs then resolved the traversal away before the
+		// containment check could catch it.
+		{"C:../secret", true},
+		{"c:../secret", true},
+		{"C:..", true},
+		{"C:/absolute/ok", false},
+
+		// A leading "X:" that is not a drive letter, and ordinary names that
+		// merely start with "..", stay allowed.
+		{"1:../secret", false},
+		{"..hidden", false},
+		{"backup..2024.log", false},
 	}
 	for _, tt := range tests {
 		got := containsTraversalSegment(tt.path)
@@ -244,8 +259,13 @@ func TestValidateFileReadable(t *testing.T) {
 		})
 	}
 
-	// File exists but not readable (no read permission) - covers os.Open failure path
-	if runtime.GOOS != "windows" {
+	// File exists but not readable (no read permission) - covers os.Open failure path.
+	//
+	// Permission bits are not enforced for uid 0, so this case alone cannot be
+	// simulated in a root container -- the default for many CI images. The
+	// table-driven cases above do not depend on permission bits and keep
+	// running there.
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 		noReadFile, err := os.CreateTemp("", "test_noread_*")
 		if err != nil {
 			t.Fatalf("Failed to create temp file: %v", err)
@@ -341,8 +361,10 @@ func TestValidateDirWritable(t *testing.T) {
 		})
 	}
 
-	// Read-only directory: Create should fail (covers ErrDirNotWritable path)
-	if runtime.GOOS != "windows" {
+	// Read-only directory: Create should fail (covers ErrDirNotWritable path).
+	// Skipped for uid 0, which is not subject to the permission bits; the
+	// table-driven cases above still run there.
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
 		readOnlyDir, err := os.MkdirTemp("", "test_readonly_*")
 		if err != nil {
 			t.Fatalf("Failed to create temp dir: %v", err)
