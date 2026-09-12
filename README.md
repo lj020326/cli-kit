@@ -14,7 +14,7 @@ A comprehensive Go library for building robust command-line applications. This t
 - **Environment Variable Management** - Safe and flexible environment variable operations with type conversion
 - **Flag Utilities** - Enhanced command-line flag handling with type-safe getters
 - **Configuration Resolution** - Priority-based configuration resolution (CLI flags > environment variables > defaults)
-- **Validators** - Comprehensive validation for URLs, paths, ports, host:port, and enums with SSRF protection
+- **Validators** - URLs, paths, ports, host:port, enums, numbers, phones, emails and usernames, with SSRF and path-traversal protection
 - **Test Utilities** - Helper functions for testing CLI applications and configuration resolution
 
 ## Installation
@@ -152,6 +152,11 @@ port, err := configutil.ResolvePortPflag(fs, "port", "PORT", 8080)
 base := configutil.ResolveBoolPflag(fs, "debug", "", false) // empty envKey: CLI or default only
 ```
 
+Available `*Pflag` resolvers: `ResolveStringPflag`, `ResolveIntPflag`,
+`ResolveBoolPflag`, `ResolveDurationPflag`, `ResolvePortPflag`,
+`ResolveEnumPflag`, `ResolveIntAsStringPflag`, `ResolveIntWithValidationPflag`,
+`ResolveStringWithValidationPflag`.
+
 Additional configutil APIs (same priority: CLI > ENV > default):
 
 - **ResolveInt64** / **ResolveInt64WithValidation** - int64 and with custom validator
@@ -166,89 +171,206 @@ Additional configutil APIs (same priority: CLI > ENV > default):
 
 ```go
 import "github.com/soulteary/cli-kit/validator"
+```
 
-// Validate URL (with SSRF protection by default)
+#### URLs and SSRF
+
+`ValidateURL` blocks private addresses and loopback by default. Passing `nil`
+gets the safe defaults:
+
+```go
 err := validator.ValidateURL("https://api.example.com", nil)
+```
 
-// With custom options
+Every field is optional, and an unset field takes its default — a partial
+struct never weakens the check:
+
+```go
 opts := &validator.URLOptions{
     AllowedSchemes: []string{"http", "https", "ws", "wss"},
     AllowLocalhost: true,
     AllowPrivateIP: false,
 }
 err := validator.ValidateURL("http://localhost:8080", opts)
+```
 
-// Validate port (range: 1-65535)
-err := validator.ValidatePort(8080)
-err := validator.ValidatePortString("8080")
+| Option | Default | Notes |
+|--------|---------|-------|
+| `AllowedSchemes` | `http`, `https` | unset means the default list |
+| `AllowLocalhost` | `false` | also matches `localhost.` and `*.localhost` |
+| `AllowPrivateIP` | `false` | RFC 1918, link-local, CGNAT, `192.0.0.0/24`, TEST-NET, `240.0.0.0/4` |
+| `ResolveHostTimeout` | `5s` | bound on the DNS lookup; `0` means the default |
+| `DisableHostResolution` | `false` | skip DNS entirely — the explicit opt-out |
 
-// Validate host:port
-host, port, err := validator.ValidateHostPort("localhost:8080")
+A hostname is resolved and every address it returns is checked, so a name
+pointing at `169.254.169.254` is rejected. Set `DisableHostResolution` only
+where you have another control in place, or in tests that must stay offline.
 
-// Validate host:port with defaults
-host, port, err := validator.ValidateHostPortWithDefaults("myhost", "localhost", 8080)
+**`ValidateURL` alone is not sufficient against DNS rebinding.** It inspects
+the addresses a name resolved to *at validation time*, while your HTTP client
+resolves again when it connects. A short-TTL record can answer differently the
+second time — a public address for the validator, a link-local one for the
+request. Close that window with `SSRFDialControl`, which applies the same
+policy to the address actually being dialled:
 
-// Validate path (with security checks)
+```go
+opts := &validator.URLOptions{AllowedSchemes: []string{"https"}}
+
+if err := validator.ValidateURL(rawURL, opts); err != nil {
+    return err
+}
+
+transport := &http.Transport{
+    // Proxying is disabled deliberately: see the caveat below.
+    Proxy:       nil,
+    DialContext: (&net.Dialer{Control: validator.SSRFDialControl(opts)}).DialContext,
+}
+client := &http.Client{Transport: transport}
+```
+
+> **Proxy caveat.** With a proxy in effect — including the one
+> `http.DefaultTransport` picks up from `HTTP_PROXY`/`HTTPS_PROXY` — the hook
+> sees the *proxy's* address, not the origin's. A public proxy would then
+> resolve a rebinding hostname to an internal address without this control ever
+> seeing it, while a private corporate proxy is rejected outright. Where a proxy
+> is required, the hook only closes the rebinding window for direct connections.
+
+#### Paths
+
+```go
 absPath, err := validator.ValidatePath("/var/log/app.log", nil)
 
-// With custom options
 pathOpts := &validator.PathOptions{
     AllowRelative:  false,
     AllowedDirs:    []string{"/var/log", "/tmp"},
     CheckTraversal: true,
 }
-absPath, err := validator.ValidatePath("../etc/passwd", pathOpts) // Error: path traversal
+absPath, err = validator.ValidatePath("../etc/passwd", pathOpts) // rejected
+```
 
-// Validate enum
-err := validator.ValidateEnum("production", 
+| Option | Default | Notes |
+|--------|---------|-------|
+| `AllowRelative` | `false` | reject a path that is not absolute |
+| `AllowedDirs` | none | containment allowlist; bases are symlink-resolved too |
+| `CheckTraversal` | `false` | reject a `..` parent reference |
+
+`CheckTraversal` matches `..` as a whole path segment, so ordinary names like
+`backup..2024.log` and `..hidden` are accepted. It splits on both `/` and `\`
+on every platform, strips a Windows drive prefix before splitting (so
+`C:..\secret` is caught on Linux too), and treats a segment of only periods and
+spaces with at least two periods as a parent reference — because Win32 strips
+trailing spaces and periods from a component, making `safe\.. \secret` open the
+parent.
+
+Containment resolves symlinks on both sides, including for a target that does
+not exist yet: the deepest existing ancestor is resolved and the remaining
+components re-attached. With `/allowed/link` a symlink to `/etc`, validating
+`/allowed/link/newfile` is correctly rejected.
+
+> **Time-of-check/time-of-use.** `ValidatePath` returns a *name*, not an open
+> handle. The path can be replaced between the check and your `os.Open`. Where
+> that matters, open the file and verify the handle (for example with
+> `os.OpenFile` plus `O_NOFOLLOW`) rather than trusting the validated name.
+
+#### Ports and host:port
+
+```go
+err := validator.ValidatePort(8080)                  // 1-65535
+port, err := validator.ValidatePortString("8080")
+
+host, port, err := validator.ValidateHostPort("localhost:8080")
+host, port, err = validator.ValidateHostPortWithDefaults("myhost", "localhost", 8080)
+host, port, err = validator.ParseHostPort("example.com:443") // parse without validating
+```
+
+Scoped IPv6 addresses keep their zone: `[fe80::1%eth0]:443` parses correctly.
+
+#### Enums and numbers
+
+```go
+err := validator.ValidateEnum("production",
     []string{"development", "production", "staging"},
     false, // case-insensitive
 )
+err = validator.ValidateEnumCaseInsensitive("PRODUCTION", allowed)
+err = validator.ValidateEnumCaseSensitive("production", allowed)
 
-// Validate numbers (positive, non-negative, range)
-err := validator.ValidatePositive(42)                      // > 0
+err = validator.ValidatePositive(42)            // > 0
 err = validator.ValidatePositiveInt64(100)
-err = validator.ValidateNonNegative(0)                    // >= 0
+err = validator.ValidateNonNegative(0)          // >= 0
 err = validator.ValidateNonNegativeInt64(0)
-err = validator.ValidateInRange(port, 1, 65535)          // [min, max] inclusive
+err = validator.ValidateInRange(port, 1, 65535) // inclusive
 err = validator.ValidateInRangeInt64(n, 0, 100)
-// Errors: validator.ErrNotPositive, validator.ErrNegative
+```
 
-// Validate phone number (supports multiple regions)
-err := validator.ValidatePhone("13800138000", nil) // Any format
-err := validator.ValidatePhoneCN("13800138000")    // Chinese mainland
-err := validator.ValidatePhoneUS("+12025551234")   // US format
-err := validator.ValidatePhoneUK("+447911123456")  // UK format
+#### Phone numbers
 
-// With custom options
-phoneOpts := &validator.PhoneOptions{
+```go
+err := validator.ValidatePhone("13800138000", nil) // any format
+err = validator.ValidatePhoneCN("13800138000")
+err = validator.ValidatePhoneUS("+12025551234")
+err = validator.ValidatePhoneUK("+447911123456")
+err = validator.ValidatePhoneInternational("+8613800138000")
+
+err = validator.ValidatePhone("13800138000", &validator.PhoneOptions{
     AllowEmpty: true,
-    Region:     validator.PhoneRegionCN,
-}
-err := validator.ValidatePhone("13800138000", phoneOpts)
+    Region:     validator.PhoneRegionCN, // or PhoneRegionUS/UK/International/Any
+})
+```
 
-// Validate email
+#### Email addresses
+
+```go
 err := validator.ValidateEmailSimple("user@example.com")
+err = validator.ValidateEmailWithDomains("user@company.com", []string{"company.com"})
 
-// With domain restrictions
-err := validator.ValidateEmailWithDomains("user@company.com", []string{"company.com"})
-
-// With full options
-emailOpts := &validator.EmailOptions{
+err = validator.ValidateEmail("user@company.com", &validator.EmailOptions{
     AllowEmpty:     false,
     AllowedDomains: []string{"company.com", "corp.com"},
     BlockedDomains: []string{"spam.com"},
-}
-err := validator.ValidateEmail("user@company.com", emailOpts)
+})
 
-// Validate username
-err := validator.ValidateUsername("john_doe", nil)           // Default style (3-32 chars)
-err := validator.ValidateUsernameSimple("johndoe")           // Alphanumeric only
-err := validator.ValidateUsernameRelaxed("john.doe")         // Allows dots (3-64 chars)
-
-// With reserved names
-err := validator.ValidateUsernameWithReserved("admin", []string{"admin", "root", "system"})
+domain := validator.ExtractEmailDomain("user@example.com") // "example.com"
 ```
+
+#### Usernames
+
+```go
+err := validator.ValidateUsername("john_doe", nil)   // default style, 3-32 chars
+err = validator.ValidateUsernameSimple("johndoe")    // alphanumeric only
+err = validator.ValidateUsernameRelaxed("john.doe")  // allows dots, 3-64 chars
+err = validator.ValidateUsernameWithReserved("admin", []string{"admin", "root"})
+
+err = validator.ValidateUsername("john_doe", &validator.UsernameOptions{
+    Style:         validator.UsernameStyleCustom, // or Default/Simple/Relaxed
+    CustomPattern: regexp.MustCompile(`^[a-z][a-z0-9-]{2,15}$`),
+    MinLength:     3,
+    MaxLength:     16,
+    ReservedNames: []string{"admin", "root"},
+    AllowEmpty:    false,
+})
+
+normalized := validator.NormalizeUsername("  John_Doe ") // trimmed, lower-cased
+ok := validator.IsValidUsernameChar('_')
+```
+
+#### Files and directories
+
+```go
+err := validator.ValidateFileExists("/etc/app.conf")
+err = validator.ValidateFileReadable("/etc/app.conf")
+err = validator.ValidateDirExists("/var/log")
+err = validator.ValidateDirWritable("/var/log")
+```
+
+#### Error sentinels
+
+Match with `errors.Is`:
+
+`ErrInvalidPort`, `ErrInvalidHostPort`, `ErrInvalidEnumValue`, `ErrInvalidEmail`,
+`ErrInvalidPhone`, `ErrInvalidUsername`, `ErrNotPositive`, `ErrNegative`,
+`ErrFileNotFound`, `ErrFileNotReadable`, `ErrNotAFile`, `ErrDirNotFound`,
+`ErrDirNotWritable`, `ErrNotADirectory`.
 
 ### Test Utilities
 
@@ -341,38 +463,98 @@ cli-kit/
     └── config.go     # Configuration test helpers
 ```
 
+## Upgrade Notes (v1.9.0)
+
+All changes are in `validator`. One field and one function were added; nothing
+was removed. Some inputs that used to pass are now correctly rejected, and some
+that used to be rejected now pass.
+
+- **A partial `URLOptions` no longer switches off hostname checking.**
+  `ResolveHostTimeout` was copied unconditionally and its zero value meant "skip
+  DNS resolution", so
+
+  ```go
+  validator.ValidateURL(u, &validator.URLOptions{
+      AllowedSchemes: []string{"https"},
+  })
+  ```
+
+  which reads as "narrow the scheme list", also accepted any hostname without
+  resolving it — including one pointing at `169.254.169.254`. Zero now means
+  "use the default 5s". **If you relied on the old behaviour to keep a test
+  offline, set `DisableHostResolution: true`** — otherwise those calls will
+  start performing real DNS lookups.
+- **`SSRFDialControl` is new, and `ValidateURL` is documented as insufficient
+  on its own.** Validation checks the addresses a name resolved to; the client
+  resolves again when it connects. Add the dial hook wherever you fetch a
+  caller-supplied URL.
+- **`CheckTraversal` accepts legal names containing dots.** It used
+  `strings.Contains(path, "..")`, which rejected `backup..2024.log` and
+  `..hidden`. It now matches `..` as a whole segment.
+- **`CheckTraversal` catches traversal it previously missed.** Windows
+  drive-relative paths (`C:..\secret`), backslash-separated paths validated on
+  Linux, and the spellings Win32 normalizes into `..` (`safe\.. \secret`) all
+  escaped the segment check. On POSIX this refuses one otherwise legal name,
+  `...`, which is the right side to err on under an explicitly requested
+  traversal check.
+- **A symlinked parent no longer escapes `AllowedDirs` for a file that does not
+  exist yet.** `EvalSymlinks` fails on a non-existent path and the fallback
+  checked the unresolved name, so with `/allowed/link` pointing at `/etc`,
+  validating `/allowed/link/newfile` looked contained while the write landed in
+  `/etc/newfile`. Reading existing files was protected; creating new ones was
+  not.
+- **Allowed bases are resolved the same way as the request.** With
+  `alias -> /real` and `AllowedDirs: ["alias/future"]`, a genuinely contained
+  creation used to be rejected because the base stayed lexical.
+- **`AllowLocalhost` matches more spellings.** `localhost.` and `*.localhost`
+  both resolve to loopback and were missed by the bare string compare.
+- **More ranges count as private.** `192.0.0.0/24`, `192.0.2.0/24` (TEST-NET-1)
+  and `240.0.0.0/4` are blocked unless `AllowPrivateIP` is set. Two documented
+  globally reachable addresses in that first block are excepted: `192.0.0.9`
+  (PCP anycast, RFC 7723) and `192.0.0.10` (TURN anycast, RFC 8155), so reaching
+  them no longer means enabling all private addresses.
+- **Scoped IPv6 addresses validate.** `[fe80::1%eth0]:443` was rejected as "not
+  an IP" even with `AllowPrivateIP` set, because the zone was left on the string
+  handed to `net.ParseIP`.
+- **`ValidatePath`'s time-of-check/time-of-use gap is documented.** It returns a
+  name, not an open handle.
+
 ## Security Features
 
 | Feature | Description |
 |---------|-------------|
-| **SSRF Protection** | URL validator blocks private IPs and localhost by default |
-| **Path Traversal Prevention** | Path validator detects and blocks `..` sequences |
-| **Directory Restrictions** | Optional allowlist for permitted directories |
-| **Safe File Reading** | Password file reading with path validation |
+| **SSRF protection** | `ValidateURL` resolves hostnames and rejects private, loopback, link-local, CGNAT and reserved addresses by default. A partial `URLOptions` cannot weaken it. |
+| **DNS rebinding** | `SSRFDialControl` re-applies the policy to the address actually dialled, closing the check-then-use window `ValidateURL` cannot |
+| **Path traversal** | `CheckTraversal` matches `..` as a path segment, on both separators, after a Windows drive prefix, including the spellings Win32 normalizes into `..` |
+| **Symlink containment** | `AllowedDirs` resolves symlinks on both sides, including for a target that does not exist yet |
+| **Directory restrictions** | Optional allowlist of permitted directories |
+| **Safe file reading** | `flagutil.ReadPasswordFromFile` validates the path before reading |
 
 ## Test Coverage
-
-This project maintains high test coverage:
 
 | Package | Coverage |
 |---------|----------|
 | configutil | 100% |
 | env | 100% |
-| flagutil | 100% |
-| validator | 91.9% |
-| testutil | 86.7% |
-| **Total** | **94.6%** |
+| flagutil | 96.7% |
+| validator | 92.9% |
+| testutil | 88.7% |
+| **Total** | **95.2%** |
 
 Run tests with coverage:
 
 ```bash
-go test -coverprofile=coverage.out ./...
+go test ./... -coverprofile=coverage.out -covermode=atomic
 go tool cover -func=coverage.out
 ```
 
+A few `validator` and `flagutil` tests simulate I/O failures with `chmod`, which
+uid 0 ignores; those sections skip when the suite runs as root.
+
 ## Requirements
 
-- Go 1.26 or later
+- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
+- Optional: `github.com/spf13/pflag` for the `*Pflag` helpers
 
 ## License
 
