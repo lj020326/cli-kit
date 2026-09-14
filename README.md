@@ -1,11 +1,9 @@
 # cli-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/cli-kit.svg)](https://pkg.go.dev/github.com/soulteary/cli-kit)
+[![Go Reference](https://pkg.go.dev/badge/github.com/lj020326/cli-kit.svg)](https://pkg.go.dev/github.com/lj020326/cli-kit)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![codecov](https://codecov.io/gh/soulteary/cli-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/cli-kit)
-
-[中文文档](README_CN.md)
+[![codecov](https://codecov.io/gh/lj020326/cli-kit/graph/badge.svg)](https://codecov.io/gh/lj020326/cli-kit)
 
 A comprehensive Go library for building robust command-line applications. This toolkit provides utilities for environment variable management, command-line flag handling, priority-based configuration resolution, input validation, and testing support.
 
@@ -20,7 +18,7 @@ A comprehensive Go library for building robust command-line applications. This t
 ## Installation
 
 ```bash
-go get github.com/soulteary/cli-kit
+go get github.com/lj020326/cli-kit
 ```
 
 ## Quick Start
@@ -28,7 +26,7 @@ go get github.com/soulteary/cli-kit
 ### Environment Variables
 
 ```go
-import "github.com/soulteary/cli-kit/env"
+import "github.com/lj020326/cli-kit/env"
 
 // Check if environment variable exists
 if env.Has("PORT") {
@@ -59,7 +57,7 @@ value, ok := env.Lookup("API_KEY")
 ### Flag Utilities
 
 ```go
-import "github.com/soulteary/cli-kit/flagutil"
+import "github.com/lj020326/cli-kit/flagutil"
 
 fs := flag.NewFlagSet("app", flag.ContinueOnError)
 port := fs.Int("port", 8080, "Server port")
@@ -88,7 +86,7 @@ password, err := flagutil.ReadPasswordFromFile("/path/to/password.txt")
 **pflag support**: When using [spf13/pflag](https://github.com/spf13/pflag) (short flags, deprecated marks, etc.), use the `*Pflag` helpers with the same semantics:
 
 ```go
-import "github.com/soulteary/cli-kit/flagutil"
+import "github.com/lj020326/cli-kit/flagutil"
 "github.com/spf13/pflag"
 
 fs := pflag.NewFlagSet("app", pflag.ContinueOnError)
@@ -106,7 +104,7 @@ if flagutil.HasFlagPflag(fs, "port") {
 The `configutil` package resolves configuration values with a clear priority order: **CLI flags > Environment variables > Default values**.
 
 ```go
-import "github.com/soulteary/cli-kit/configutil"
+import "github.com/lj020326/cli-kit/configutil"
 
 fs := flag.NewFlagSet("app", flag.ContinueOnError)
 portFlag := fs.Int("port", 0, "Server port")
@@ -170,7 +168,7 @@ Additional configutil APIs (same priority: CLI > ENV > default):
 ### Validators
 
 ```go
-import "github.com/soulteary/cli-kit/validator"
+import "github.com/lj020326/cli-kit/validator"
 ```
 
 #### URLs and SSRF
@@ -376,7 +374,7 @@ Match with `errors.Is`:
 
 ```go
 import (
-    "github.com/soulteary/cli-kit/testutil"
+    "github.com/lj020326/cli-kit/testutil"
     "testing"
 )
 

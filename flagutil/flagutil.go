@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/soulteary/cli-kit/validator"
+	"github.com/lj020326/cli-kit/validator"
 )
 
 // HasFlag checks if a command-line flag is set in the given FlagSet

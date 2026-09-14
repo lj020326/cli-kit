@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/soulteary/cli-kit/env"
-	"github.com/soulteary/cli-kit/flagutil"
-	"github.com/soulteary/cli-kit/validator"
+	"github.com/lj020326/cli-kit/env"
+	"github.com/lj020326/cli-kit/flagutil"
+	"github.com/lj020326/cli-kit/validator"
 	"github.com/spf13/pflag"
 )
 

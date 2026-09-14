@@ -1,4 +1,4 @@
-module github.com/soulteary/cli-kit
+module github.com/lj020326/cli-kit
 
 go 1.27.0
 
